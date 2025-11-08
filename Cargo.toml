@@ -1,0 +1,13 @@
+[package]
+name = "a2"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "a2"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.27.1", features = ["extension-module"] }
+itertools = "0.14.0"
+rayon = "1.11.0"
