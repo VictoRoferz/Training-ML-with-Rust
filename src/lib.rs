@@ -1,5 +1,6 @@
 use numpy::ndarray::{ArrayView1, ArrayView2, Axis};
 use pyo3::prelude::*;
+use rayon::{join, prelude::*};
 use std::cmp::Ordering;
 
 type Class = usize;
@@ -129,11 +130,25 @@ impl DecisionTreeClassifier {
         let right_x = x.select(Axis(0), &right_idx);
         let right_y = y.select(Axis(0), &right_idx);
 
-        TreeNode::Internal {
-            feature_index: feature,
-            threshold,
-            left: Box::new(self.build_tree(left_x.view(), left_y.view(), depth + 1)),
-            right: Box::new(self.build_tree(right_x.view(), right_y.view(), depth + 1)),
+        // Limiting recursion parallelism, might get out of hand with larger trees
+        if depth < 4 {
+            let (left, right) = join(
+                || self.build_tree(left_x.view(), left_y.view(), depth + 1),
+                || self.build_tree(right_x.view(), right_y.view(), depth + 1),
+            );
+            TreeNode::Internal {
+                feature_index: feature,
+                threshold,
+                left: Box::new(left),
+                right: Box::new(right),
+            }
+        } else {
+            TreeNode::Internal {
+                feature_index: feature,
+                threshold,
+                left: Box::new(self.build_tree(left_x.view(), left_y.view(), depth + 1)),
+                right: Box::new(self.build_tree(right_x.view(), right_y.view(), depth + 1)),
+            }
         }
     }
 
@@ -146,71 +161,83 @@ impl DecisionTreeClassifier {
     ) -> (usize, f64, bool) {
         let n_samples = x.nrows();
         let n_features = x.ncols();
-        let mut best_gain = 0.0;
-        let mut best_feature = 0;
-        let mut best_thresh = 0.0;
-        let mut found = false;
 
-        for f in 0..n_features {
-            let mut sorted: Vec<(f64, usize)> = (0..n_samples).map(|i| (x[[i, f]], i)).collect();
+        // Each feature is independent — parallelize across features
+        let best = (0..n_features)
+            .into_par_iter()
+            .map(|f| {
+                // Pair (feature value, index)
+                let mut sorted: Vec<(f64, usize)> =
+                    (0..n_samples).map(|i| (x[[i, f]], i)).collect();
 
-            sorted.sort_unstable_by(|a, b| match (a.0.is_nan(), b.0.is_nan()) {
-                (true, true) => Ordering::Equal,
-                (true, false) => Ordering::Greater,
-                (false, true) => Ordering::Less,
-                (false, false) => a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal),
-            });
+                sorted.sort_unstable_by(|a, b| match (a.0.is_nan(), b.0.is_nan()) {
+                    (true, true) => Ordering::Equal,
+                    (true, false) => Ordering::Greater,
+                    (false, true) => Ordering::Less,
+                    (false, false) => a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal),
+                });
 
-            let mut left_counts = vec![0; self.n_classes];
-            let mut right_counts = counts.to_vec();
-            let mut n_left = 0;
-            let mut n_right = n_samples;
+                let mut left_counts = vec![0; self.n_classes];
+                let mut right_counts = counts.to_vec();
+                let mut n_left = 0;
+                let mut n_right = n_samples;
 
-            for i in 0..(n_samples - 1) {
-                let (_, idx) = sorted[i];
-                let cls = y[idx];
-                n_left += 1;
-                n_right -= 1;
-                left_counts[cls] += 1;
-                right_counts[cls] -= 1;
+                let mut best_gain = 0.0;
+                let mut best_thresh = 0.0;
+                let mut found = false;
 
-                if n_left < self.min_samples_leaf || n_right < self.min_samples_leaf {
-                    continue;
+                // Try each possible split point
+                for i in 0..(n_samples - 1) {
+                    let (_, idx) = sorted[i];
+                    let cls = y[idx];
+                    n_left += 1;
+                    n_right -= 1;
+                    left_counts[cls] += 1;
+                    right_counts[cls] -= 1;
+
+                    if n_left < self.min_samples_leaf || n_right < self.min_samples_leaf {
+                        continue;
+                    }
+
+                    let val = sorted[i].0;
+                    let next = sorted[i + 1].0;
+                    if (val - next).abs() <= f64::EPSILON {
+                        continue; // skip identical values
+                    }
+
+                    let thresh = 0.5 * (val + next);
+                    let g_left = self.gini(&left_counts);
+                    let g_right = self.gini(&right_counts);
+                    let weighted = (n_left as f64 / n_samples as f64) * g_left
+                        + (n_right as f64 / n_samples as f64) * g_right;
+                    let gain = parent_gini - weighted;
+
+                    if gain > best_gain {
+                        best_gain = gain;
+                        best_thresh = thresh;
+                        found = true;
+                    }
                 }
 
-                let val = sorted[i].0;
-                let next = sorted[i + 1].0;
-                if (val - next).abs() <= f64::EPSILON {
-                    continue;
-                }
+                (f, best_thresh, best_gain, found)
+            })
+            .reduce(
+                || (0, 0.0, 0.0, false),
+                |a, b| if b.2 > a.2 { b } else { a },
+            );
 
-                let thresh = 0.5 * (val + next);
-                let g_left = self.gini(&left_counts);
-                let g_right = self.gini(&right_counts);
-                let weighted = (n_left as f64 / n_samples as f64) * g_left
-                    + (n_right as f64 / n_samples as f64) * g_right;
-                let gain = parent_gini - weighted;
-
-                if gain > best_gain {
-                    best_gain = gain;
-                    best_feature = f;
-                    best_thresh = thresh;
-                    found = true;
-                }
-            }
-        }
-
-        (best_feature, best_thresh, found && best_gain > 0.0)
+        let (feature, thresh, gain, found) = best;
+        (feature, thresh, found && gain > 0.0)
     }
 
     fn class_counts(&self, y: ArrayView1<'_, usize>) -> Vec<usize> {
-        let mut counts = vec![0; self.n_classes];
-        for &cls in y.iter() {
-            if cls < counts.len() {
+        y.iter().filter(|&&cls| cls < self.n_classes).fold(
+            vec![0; self.n_classes],
+            |mut counts, &cls| {
                 counts[cls] += 1;
-            }
-        }
-        counts
+                counts
+            },
+        )
     }
 
     fn partition(&self, x: ArrayView2<'_, f64>, f: usize, t: f64) -> (Vec<usize>, Vec<usize>) {
