@@ -3,11 +3,6 @@ use pyo3::prelude::*;
 use rayon::{join, prelude::*};
 use std::cmp::Ordering;
 
-type Class = usize;
-
-/// Decision Tree Classifier (CART-style)
-///
-/// Massimo’s version: clear, honest, and efficient — without over-optimization.
 pub struct DecisionTreeClassifier {
     max_depth: Option<usize>,
     min_samples_split: usize,
@@ -19,7 +14,7 @@ pub struct DecisionTreeClassifier {
 #[derive(Debug)]
 enum TreeNode {
     Leaf {
-        class: Class,
+        class: usize,
     },
     Internal {
         feature_index: usize,
@@ -55,17 +50,14 @@ impl DecisionTreeClassifier {
         self.root = Some(self.build_tree(x, y, 0));
     }
 
-    pub fn predict(&self, x: ArrayView2<'_, f64>) -> Vec<Class> {
+    pub fn predict(&self, x: ArrayView2<'_, f64>) -> Vec<usize> {
         let root = self.root.as_ref().expect("Model not fitted yet.");
-        let mut preds = Vec::with_capacity(x.nrows());
-        for row in x.outer_iter() {
-            let row_vec: Vec<f64> = row.to_vec();
-            preds.push(self.predict_one(&row_vec, root));
-        }
-        preds
+        x.outer_iter()
+            .map(|row| self.predict_one(&row.to_vec(), root))
+            .collect()
     }
 
-    fn predict_one<'a>(&self, row: &[f64], mut node: &'a TreeNode) -> Class {
+    fn predict_one<'a>(&self, row: &[f64], mut node: &'a TreeNode) -> usize {
         loop {
             match node {
                 TreeNode::Leaf { class } => return *class,
@@ -100,10 +92,11 @@ impl DecisionTreeClassifier {
         let counts = self.class_counts(y);
         let n_unique = counts.iter().filter(|&&c| c > 0).count();
 
-        if n_unique == 1
+        let stop_splitting = n_unique == 1
             || self.max_depth.map_or(false, |m| depth >= m)
-            || n_samples < self.min_samples_split
-        {
+            || n_samples < self.min_samples_split;
+
+        if stop_splitting {
             return TreeNode::Leaf {
                 class: self.majority_class(&counts),
             };
@@ -119,7 +112,11 @@ impl DecisionTreeClassifier {
         }
 
         let (left_idx, right_idx) = self.partition(x, feature, threshold);
-        if left_idx.is_empty() || right_idx.is_empty() {
+
+        if [left_idx.is_empty(), right_idx.is_empty()]
+            .iter()
+            .any(|&b| b)
+        {
             return TreeNode::Leaf {
                 class: self.majority_class(&counts),
             };
@@ -162,15 +159,13 @@ impl DecisionTreeClassifier {
         let n_samples = x.nrows();
         let n_features = x.ncols();
 
-        // Each feature is independent — parallelize across features
-        let best = (0..n_features)
+        let (f, t, g, found) = (0..n_features)
             .into_par_iter()
             .map(|f| {
-                // Pair (feature value, index)
                 let mut sorted: Vec<(f64, usize)> =
                     (0..n_samples).map(|i| (x[[i, f]], i)).collect();
 
-                sorted.sort_unstable_by(|a, b| match (a.0.is_nan(), b.0.is_nan()) {
+                sorted.sort_by(|a, b| match (a.0.is_nan(), b.0.is_nan()) {
                     (true, true) => Ordering::Equal,
                     (true, false) => Ordering::Greater,
                     (false, true) => Ordering::Less,
@@ -182,52 +177,45 @@ impl DecisionTreeClassifier {
                 let mut n_left = 0;
                 let mut n_right = n_samples;
 
-                let mut best_gain = 0.0;
-                let mut best_thresh = 0.0;
-                let mut found = false;
+                (0..n_samples - 1)
+                    .filter_map(|i| {
+                        let (_, idx) = sorted[i];
+                        let cls = y[idx];
+                        n_left += 1;
+                        n_right -= 1;
+                        left_counts[cls] += 1;
+                        right_counts[cls] -= 1;
 
-                // Try each possible split point
-                for i in 0..(n_samples - 1) {
-                    let (_, idx) = sorted[i];
-                    let cls = y[idx];
-                    n_left += 1;
-                    n_right -= 1;
-                    left_counts[cls] += 1;
-                    right_counts[cls] -= 1;
+                        if n_left < self.min_samples_leaf || n_right < self.min_samples_leaf {
+                            return None;
+                        }
 
-                    if n_left < self.min_samples_leaf || n_right < self.min_samples_leaf {
-                        continue;
-                    }
+                        let val = sorted[i].0;
+                        let next = sorted[i + 1].0;
+                        if (val - next).abs() <= f64::EPSILON {
+                            return None;
+                        }
 
-                    let val = sorted[i].0;
-                    let next = sorted[i + 1].0;
-                    if (val - next).abs() <= f64::EPSILON {
-                        continue; // skip identical values
-                    }
+                        let thresh = 0.5 * (val + next);
+                        let g_left = self.gini(&left_counts);
+                        let g_right = self.gini(&right_counts);
+                        let weighted = (n_left as f64 / n_samples as f64) * g_left
+                            + (n_right as f64 / n_samples as f64) * g_right;
+                        let gain = parent_gini - weighted;
 
-                    let thresh = 0.5 * (val + next);
-                    let g_left = self.gini(&left_counts);
-                    let g_right = self.gini(&right_counts);
-                    let weighted = (n_left as f64 / n_samples as f64) * g_left
-                        + (n_right as f64 / n_samples as f64) * g_right;
-                    let gain = parent_gini - weighted;
-
-                    if gain > best_gain {
-                        best_gain = gain;
-                        best_thresh = thresh;
-                        found = true;
-                    }
-                }
-
-                (f, best_thresh, best_gain, found)
+                        Some((thresh, gain))
+                    })
+                    .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal))
+                    .map_or((f, 0.0, 0.0, false), |(best_thresh, best_gain)| {
+                        (f, best_thresh, best_gain, best_gain > 0.0)
+                    })
             })
             .reduce(
                 || (0, 0.0, 0.0, false),
                 |a, b| if b.2 > a.2 { b } else { a },
             );
 
-        let (feature, thresh, gain, found) = best;
-        (feature, thresh, found && gain > 0.0)
+        (f, t, found && g > 0.0)
     }
 
     fn class_counts(&self, y: ArrayView1<'_, usize>) -> Vec<usize> {
@@ -241,17 +229,15 @@ impl DecisionTreeClassifier {
     }
 
     fn partition(&self, x: ArrayView2<'_, f64>, f: usize, t: f64) -> (Vec<usize>, Vec<usize>) {
-        let mut left = Vec::new();
-        let mut right = Vec::new();
-        for i in 0..x.nrows() {
+        (0..x.nrows()).fold((vec![], vec![]), |mut acc, i| {
             let v = x[[i, f]];
             if v.is_nan() || v > t {
-                right.push(i);
+                acc.1.push(i);
             } else {
-                left.push(i);
+                acc.0.push(i);
             }
-        }
-        (left, right)
+            acc
+        })
     }
 
     fn majority_class(&self, counts: &[usize]) -> usize {
@@ -264,15 +250,14 @@ impl DecisionTreeClassifier {
     }
 
     fn gini(&self, counts: &[usize]) -> f64 {
-        let total: usize = counts.iter().sum();
-        if total == 0 {
+        let total = counts.iter().sum::<usize>() as f64;
+        if total == 0.0 {
             return 0.0;
         }
-        let n = total as f64;
         1.0 - counts
             .iter()
             .map(|&c| {
-                let p = c as f64 / n;
+                let p = c as f64 / total;
                 p * p
             })
             .sum::<f64>()
