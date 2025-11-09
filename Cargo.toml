@@ -1,10 +1,10 @@
 [package]
-name = "a2"
+name = "rustdt"
 version = "0.1.0"
 edition = "2024"
 
 [lib]
-name = "a2"
+name = "rustdt"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]

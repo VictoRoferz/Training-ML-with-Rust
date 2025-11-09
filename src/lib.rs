@@ -271,17 +271,17 @@ impl DecisionTreeClassifier {
 }
 
 #[pymodule]
-mod a2 {
+mod rustdt {
     use super::*;
-    use numpy::{PyReadonlyArray1, PyReadonlyArray2};
+    use numpy::{PyReadonlyArray1, PyReadonlyArray2, ndarray::Array2};
 
     #[pyclass]
-    pub struct PyDecisionTreeClassifier {
+    pub struct RustDecisionTreeClassifier {
         inner: DecisionTreeClassifier,
     }
 
     #[pymethods]
-    impl PyDecisionTreeClassifier {
+    impl RustDecisionTreeClassifier {
         #[new]
         #[pyo3(signature = (max_depth=None, min_samples_split=2, min_samples_leaf=1))]
         pub fn new(
@@ -296,7 +296,7 @@ mod a2 {
 
         pub fn fit<'py>(
             &mut self,
-            _py: Python<'py>,
+            py: Python<'py>,
             x: PyReadonlyArray2<'py, f64>,
             y: PyReadonlyArray1<'py, i64>,
         ) -> PyResult<()> {
@@ -308,16 +308,22 @@ mod a2 {
                 .collect::<PyResult<_>>()?;
 
             let y_arr = ArrayView1::from(&y_vec);
-            self.inner.fit(x_view, y_arr);
+
+            py.detach(|| {
+                self.inner.fit(x_view, y_arr);
+            });
+
             Ok(())
         }
 
         pub fn predict<'py>(
             &self,
-            _py: Python<'py>,
+            py: Python<'py>,
             x: PyReadonlyArray2<'py, f64>,
         ) -> PyResult<Vec<usize>> {
-            Ok(self.inner.predict(x.as_array()))
+            let x_array: Array2<f64> = x.as_array().to_owned();
+            let predictions = py.detach(|| self.inner.predict(x_array.view()));
+            Ok(predictions)
         }
     }
 }
