@@ -52,8 +52,13 @@ impl DecisionTreeClassifier {
 
     pub fn predict(&self, x: ArrayView2<'_, f64>) -> Vec<usize> {
         let root = self.root.as_ref().expect("Model not fitted yet.");
-        x.outer_iter()
-            .map(|row| self.predict_one(&row.to_vec(), root))
+
+        (0..x.nrows())
+            .into_par_iter()
+            .map(|i| {
+                let row = x.index_axis(Axis(0), i);
+                self.predict_one(&row.to_vec(), root)
+            })
             .collect()
     }
 
@@ -127,7 +132,7 @@ impl DecisionTreeClassifier {
         let right_x = x.select(Axis(0), &right_idx);
         let right_y = y.select(Axis(0), &right_idx);
 
-        // Limiting recursion parallelism, might get out of hand with larger trees
+        // Limiting parallelization of recursive calls, might get out of hand with larger trees
         if depth < 4 {
             let (left, right) = join(
                 || self.build_tree(left_x.view(), left_y.view(), depth + 1),
@@ -165,7 +170,8 @@ impl DecisionTreeClassifier {
                 let mut sorted: Vec<(f64, usize)> =
                     (0..n_samples).map(|i| (x[[i, f]], i)).collect();
 
-                sorted.sort_by(|a, b| match (a.0.is_nan(), b.0.is_nan()) {
+                // Significantly faster. A bit overkill maybe.
+                sorted.sort_unstable_by(|a, b| match (a.0.is_nan(), b.0.is_nan()) {
                     (true, true) => Ordering::Equal,
                     (true, false) => Ordering::Greater,
                     (false, true) => Ordering::Less,
