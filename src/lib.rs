@@ -1,7 +1,12 @@
-use itertools::Itertools;
+use numpy::ndarray::{ArrayView1, ArrayView2, Axis};
 use pyo3::prelude::*;
-use rayon::prelude::*;
+use std::cmp::Ordering;
 
+type Class = usize;
+
+/// Decision Tree Classifier (CART-style)
+///
+/// Massimo’s version: clear, honest, and efficient — without over-optimization.
 pub struct DecisionTreeClassifier {
     max_depth: Option<usize>,
     min_samples_split: usize,
@@ -13,7 +18,7 @@ pub struct DecisionTreeClassifier {
 #[derive(Debug)]
 enum TreeNode {
     Leaf {
-        class: usize,
+        class: Class,
     },
     Internal {
         feature_index: usize,
@@ -21,14 +26,6 @@ enum TreeNode {
         left: Box<TreeNode>,
         right: Box<TreeNode>,
     },
-}
-
-struct SplitResult {
-    feature_index: usize,
-    threshold: f64,
-    impurity_decrease: f64,
-    left_indices: Vec<usize>,
-    right_indices: Vec<usize>,
 }
 
 impl DecisionTreeClassifier {
@@ -46,24 +43,28 @@ impl DecisionTreeClassifier {
         }
     }
 
-    pub fn fit(&mut self, X: Vec<Vec<f64>>, y: Vec<usize>) {
-        assert!(!X.is_empty());
-        let n_samples = X.len();
-        let n_features = X[0].len();
-        assert_eq!(y.len(), n_samples);
+    pub fn fit(&mut self, x: ArrayView2<'_, f64>, y: ArrayView1<'_, usize>) {
+        assert_eq!(
+            x.nrows(),
+            y.len(),
+            "x and y must have the same number of samples"
+        );
 
-        self.n_classes = y.iter().max().unwrap() + 1;
-        let indices: Vec<usize> = (0..n_samples).collect();
-        let root = self.build_tree(&X, &y, indices, 0, n_features);
-        self.root = Some(root);
+        self.n_classes = y.iter().max().copied().unwrap_or(0) + 1;
+        self.root = Some(self.build_tree(x, y, 0));
     }
 
-    pub fn predict(&self, X: &[Vec<f64>]) -> Vec<usize> {
-        X.iter().map(|x| self.predict_one(x)).collect()
+    pub fn predict(&self, x: ArrayView2<'_, f64>) -> Vec<Class> {
+        let root = self.root.as_ref().expect("Model not fitted yet.");
+        let mut preds = Vec::with_capacity(x.nrows());
+        for row in x.outer_iter() {
+            let row_vec: Vec<f64> = row.to_vec();
+            preds.push(self.predict_one(&row_vec, root));
+        }
+        preds
     }
 
-    fn predict_one(&self, x: &[f64]) -> usize {
-        let mut node = self.root.as_ref().expect("Tree not fitted yet");
+    fn predict_one<'a>(&self, row: &[f64], mut node: &'a TreeNode) -> Class {
         loop {
             match node {
                 TreeNode::Leaf { class } => return *class,
@@ -73,10 +74,11 @@ impl DecisionTreeClassifier {
                     left,
                     right,
                 } => {
-                    node = if x[*feature_index] <= *threshold {
-                        left
-                    } else {
+                    let v = row[*feature_index];
+                    node = if v.is_nan() || v > *threshold {
                         right
+                    } else {
+                        left
                     };
                 }
             }
@@ -85,163 +87,178 @@ impl DecisionTreeClassifier {
 
     fn build_tree(
         &self,
-        X: &[Vec<f64>],
-        y: &[usize],
-        indices: Vec<usize>,
+        x: ArrayView2<'_, f64>,
+        y: ArrayView1<'_, usize>,
         depth: usize,
-        n_features: usize,
     ) -> TreeNode {
-        let n_samples = indices.len();
+        let n_samples = x.nrows();
+        if n_samples == 0 {
+            return TreeNode::Leaf { class: 0 };
+        }
 
-        if indices.iter().map(|&i| y[i]).all_equal() {
+        let counts = self.class_counts(y);
+        let n_unique = counts.iter().filter(|&&c| c > 0).count();
+
+        if n_unique == 1
+            || self.max_depth.map_or(false, |m| depth >= m)
+            || n_samples < self.min_samples_split
+        {
             return TreeNode::Leaf {
-                class: y[indices[0]],
+                class: self.majority_class(&counts),
             };
         }
 
-        if self.max_depth.map_or(false, |max| depth >= max) || n_samples < self.min_samples_split {
+        let parent_gini = self.gini(&counts);
+        let (feature, threshold, gain_found) = self.find_best_split(x, y, &counts, parent_gini);
+
+        if !gain_found {
             return TreeNode::Leaf {
-                class: majority_class(y, &indices, self.n_classes),
+                class: self.majority_class(&counts),
             };
         }
 
-        let best_split = (0..n_features)
-            .into_iter()
-            .filter_map(|j| {
-                find_best_split_for_feature(
-                    X,
-                    y,
-                    &indices,
-                    j,
-                    self.n_classes,
-                    self.min_samples_leaf,
-                )
-            })
-            .max_by(|a, b| {
-                a.impurity_decrease
-                    .partial_cmp(&b.impurity_decrease)
-                    .unwrap()
+        let (left_idx, right_idx) = self.partition(x, feature, threshold);
+        if left_idx.is_empty() || right_idx.is_empty() {
+            return TreeNode::Leaf {
+                class: self.majority_class(&counts),
+            };
+        }
+
+        let left_x = x.select(Axis(0), &left_idx);
+        let left_y = y.select(Axis(0), &left_idx);
+        let right_x = x.select(Axis(0), &right_idx);
+        let right_y = y.select(Axis(0), &right_idx);
+
+        TreeNode::Internal {
+            feature_index: feature,
+            threshold,
+            left: Box::new(self.build_tree(left_x.view(), left_y.view(), depth + 1)),
+            right: Box::new(self.build_tree(right_x.view(), right_y.view(), depth + 1)),
+        }
+    }
+
+    fn find_best_split(
+        &self,
+        x: ArrayView2<'_, f64>,
+        y: ArrayView1<'_, usize>,
+        counts: &[usize],
+        parent_gini: f64,
+    ) -> (usize, f64, bool) {
+        let n_samples = x.nrows();
+        let n_features = x.ncols();
+        let mut best_gain = 0.0;
+        let mut best_feature = 0;
+        let mut best_thresh = 0.0;
+        let mut found = false;
+
+        for f in 0..n_features {
+            let mut sorted: Vec<(f64, usize)> = (0..n_samples).map(|i| (x[[i, f]], i)).collect();
+
+            sorted.sort_unstable_by(|a, b| match (a.0.is_nan(), b.0.is_nan()) {
+                (true, true) => Ordering::Equal,
+                (true, false) => Ordering::Greater,
+                (false, true) => Ordering::Less,
+                (false, false) => a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal),
             });
 
-        match best_split {
-            None => TreeNode::Leaf {
-                class: majority_class(y, &indices, self.n_classes),
-            },
-            Some(split) => {
-                let left = self.build_tree(X, y, split.left_indices, depth + 1, n_features);
-                let right = self.build_tree(X, y, split.right_indices, depth + 1, n_features);
-                TreeNode::Internal {
-                    feature_index: split.feature_index,
-                    threshold: split.threshold,
-                    left: Box::new(left),
-                    right: Box::new(right),
+            let mut left_counts = vec![0; self.n_classes];
+            let mut right_counts = counts.to_vec();
+            let mut n_left = 0;
+            let mut n_right = n_samples;
+
+            for i in 0..(n_samples - 1) {
+                let (_, idx) = sorted[i];
+                let cls = y[idx];
+                n_left += 1;
+                n_right -= 1;
+                left_counts[cls] += 1;
+                right_counts[cls] -= 1;
+
+                if n_left < self.min_samples_leaf || n_right < self.min_samples_leaf {
+                    continue;
+                }
+
+                let val = sorted[i].0;
+                let next = sorted[i + 1].0;
+                if (val - next).abs() <= f64::EPSILON {
+                    continue;
+                }
+
+                let thresh = 0.5 * (val + next);
+                let g_left = self.gini(&left_counts);
+                let g_right = self.gini(&right_counts);
+                let weighted = (n_left as f64 / n_samples as f64) * g_left
+                    + (n_right as f64 / n_samples as f64) * g_right;
+                let gain = parent_gini - weighted;
+
+                if gain > best_gain {
+                    best_gain = gain;
+                    best_feature = f;
+                    best_thresh = thresh;
+                    found = true;
                 }
             }
         }
-    }
-}
 
-fn gini_from_labels(labels: &[usize], n_classes: usize) -> f64 {
-    let n = labels.len() as f64;
-    if n == 0.0 {
-        return 0.0;
-    }
-    let counts = (0..n_classes)
-        .map(|c| labels.iter().filter(|&&yi| yi == c).count() as f64)
-        .collect_vec();
-    1.0 - counts.iter().map(|&p| (p / n).powi(2)).sum::<f64>()
-}
-
-fn majority_class(y: &[usize], indices: &[usize], n_classes: usize) -> usize {
-    let counts = (0..n_classes)
-        .map(|c| indices.iter().filter(|&&i| y[i] == c).count())
-        .collect_vec();
-    counts
-        .iter()
-        .enumerate()
-        .max_by_key(|&(_, c)| c)
-        .map(|(cls, _)| cls)
-        .unwrap()
-}
-
-fn find_best_split_for_feature(
-    X: &[Vec<f64>],
-    y: &[usize],
-    indices: &[usize],
-    feature_index: usize,
-    n_classes: usize,
-    min_samples_leaf: usize,
-) -> Option<SplitResult> {
-    let n_samples = indices.len();
-    if n_samples <= 2 * min_samples_leaf {
-        return None;
+        (best_feature, best_thresh, found && best_gain > 0.0)
     }
 
-    let sorted = indices
-        .iter()
-        .map(|&i| (X[i][feature_index], i))
-        .sorted_by(|a, b| a.0.partial_cmp(&b.0).unwrap())
-        .collect_vec();
-
-    let parent_impurity = gini_from_labels(&indices.iter().map(|&i| y[i]).collect_vec(), n_classes);
-
-    let mut best: Option<SplitResult> = None;
-
-    for i in 0..(n_samples - 1) {
-        let (val, _) = sorted[i];
-        let next_val = sorted[i + 1].0;
-
-        if (val - next_val).abs() < f64::EPSILON {
-            continue;
+    fn class_counts(&self, y: ArrayView1<'_, usize>) -> Vec<usize> {
+        let mut counts = vec![0; self.n_classes];
+        for &cls in y.iter() {
+            if cls < counts.len() {
+                counts[cls] += 1;
+            }
         }
-
-        let left_indices = sorted[..=i].iter().map(|&(_, idx)| idx).collect_vec();
-        let right_indices = sorted[i + 1..].iter().map(|&(_, idx)| idx).collect_vec();
-
-        if left_indices.len() < min_samples_leaf || right_indices.len() < min_samples_leaf {
-            continue;
-        }
-
-        let g_left = gini_from_labels(&left_indices.iter().map(|&i| y[i]).collect_vec(), n_classes);
-        let g_right = gini_from_labels(
-            &right_indices.iter().map(|&i| y[i]).collect_vec(),
-            n_classes,
-        );
-
-        let n_left = left_indices.len() as f64;
-        let n_right = right_indices.len() as f64;
-        let n_total = n_samples as f64;
-
-        let weighted = (n_left / n_total) * g_left + (n_right / n_total) * g_right;
-        let impurity_decrease = parent_impurity - weighted;
-
-        if impurity_decrease <= 0.0 {
-            continue;
-        }
-
-        if best
-            .as_ref()
-            .map_or(true, |b| impurity_decrease > b.impurity_decrease)
-        {
-            best = Some(SplitResult {
-                feature_index,
-                threshold: 0.5 * (val + next_val),
-                impurity_decrease,
-                left_indices,
-                right_indices,
-            });
-        }
+        counts
     }
 
-    best
+    fn partition(&self, x: ArrayView2<'_, f64>, f: usize, t: f64) -> (Vec<usize>, Vec<usize>) {
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        for i in 0..x.nrows() {
+            let v = x[[i, f]];
+            if v.is_nan() || v > t {
+                right.push(i);
+            } else {
+                left.push(i);
+            }
+        }
+        (left, right)
+    }
+
+    fn majority_class(&self, counts: &[usize]) -> usize {
+        counts
+            .iter()
+            .enumerate()
+            .max_by_key(|&(_, &c)| c)
+            .map(|(i, _)| i)
+            .unwrap_or(0)
+    }
+
+    fn gini(&self, counts: &[usize]) -> f64 {
+        let total: usize = counts.iter().sum();
+        if total == 0 {
+            return 0.0;
+        }
+        let n = total as f64;
+        1.0 - counts
+            .iter()
+            .map(|&c| {
+                let p = c as f64 / n;
+                p * p
+            })
+            .sum::<f64>()
+    }
 }
 
 #[pymodule]
 mod a2 {
     use super::*;
+    use numpy::{PyReadonlyArray1, PyReadonlyArray2};
 
     #[pyclass]
-    struct PyDecisionTreeClassifier {
+    pub struct PyDecisionTreeClassifier {
         inner: DecisionTreeClassifier,
     }
 
@@ -249,22 +266,40 @@ mod a2 {
     impl PyDecisionTreeClassifier {
         #[new]
         #[pyo3(signature = (max_depth=None, min_samples_split=2, min_samples_leaf=1))]
-        fn new(
+        pub fn new(
             max_depth: Option<usize>,
             min_samples_split: usize,
             min_samples_leaf: usize,
         ) -> Self {
-            let inner = DecisionTreeClassifier::new(max_depth, min_samples_split, min_samples_leaf);
-            Self { inner }
+            Self {
+                inner: DecisionTreeClassifier::new(max_depth, min_samples_split, min_samples_leaf),
+            }
         }
 
-        fn fit(&mut self, X: Vec<Vec<f64>>, y: Vec<usize>) -> PyResult<()> {
-            self.inner.fit(X, y);
+        pub fn fit<'py>(
+            &mut self,
+            _py: Python<'py>,
+            x: PyReadonlyArray2<'py, f64>,
+            y: PyReadonlyArray1<'py, i64>,
+        ) -> PyResult<()> {
+            let x_view = x.as_array();
+            let y_vec: Vec<usize> = y
+                .as_array()
+                .iter()
+                .map(|&v| Ok(v as usize))
+                .collect::<PyResult<_>>()?;
+
+            let y_arr = ArrayView1::from(&y_vec);
+            self.inner.fit(x_view, y_arr);
             Ok(())
         }
 
-        fn predict(&self, X: Vec<Vec<f64>>) -> PyResult<Vec<usize>> {
-            Ok(self.inner.predict(&X))
+        pub fn predict<'py>(
+            &self,
+            _py: Python<'py>,
+            x: PyReadonlyArray2<'py, f64>,
+        ) -> PyResult<Vec<usize>> {
+            Ok(self.inner.predict(x.as_array()))
         }
     }
 }

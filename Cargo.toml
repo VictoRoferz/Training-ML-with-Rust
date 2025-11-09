@@ -5,9 +5,13 @@ edition = "2024"
 
 [lib]
 name = "a2"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 pyo3 = { version = "0.27.1", features = ["extension-module"] }
 itertools = "0.14.0"
 rayon = "1.11.0"
+numpy = "0.27.0"
+
+# [profile.release]
+# debug = true
