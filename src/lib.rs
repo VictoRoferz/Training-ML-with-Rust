@@ -51,13 +51,24 @@ impl DecisionTreeClassifier {
     }
 
     pub fn predict(&self, x: ArrayView2<'_, f64>) -> Vec<usize> {
-        let root = self.root.as_ref().expect("Model not fitted yet.");
+        // processing predictions in batches to avoid excessive parallelization
+        let chunk_size = 1024;
+        let root_idx = self.root.as_ref().expect("Model not fitted yet.");
+        let n_samples = x.nrows();
 
-        (0..x.nrows())
+        (0..n_samples)
             .into_par_iter()
-            .map(|i| {
-                let row = x.index_axis(Axis(0), i);
-                self.predict_one(&row.to_vec(), root)
+            .chunks(chunk_size)
+            .flat_map_iter(|chunk| {
+                chunk
+                    .into_iter()
+                    .map(|i| {
+                        x.index_axis(Axis(0), i)
+                            .as_slice()
+                            .map(|row| self.predict_one(row, root_idx))
+                            .expect("Row not contiguous")
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect()
     }
@@ -170,8 +181,7 @@ impl DecisionTreeClassifier {
                 let mut sorted: Vec<(f64, usize)> =
                     (0..n_samples).map(|i| (x[[i, f]], i)).collect();
 
-                // Significantly faster. A bit overkill maybe.
-                sorted.sort_unstable_by(|a, b| match (a.0.is_nan(), b.0.is_nan()) {
+                sorted.sort_by(|a, b| match (a.0.is_nan(), b.0.is_nan()) {
                     (true, true) => Ordering::Equal,
                     (true, false) => Ordering::Greater,
                     (false, true) => Ordering::Less,
